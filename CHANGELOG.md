@@ -1,5 +1,7 @@
 # Unreleased
 
+# 0.7.1
+
   * Add `Dtls::is_closing()` and `Dtls::is_closed()` shutdown predicates #155
 
 # 0.7.0
