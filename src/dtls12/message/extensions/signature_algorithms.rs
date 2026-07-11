@@ -101,7 +101,33 @@ mod tests {
 
         let (_, parsed) = SignatureAlgorithmsExtension::parse(&serialized).unwrap();
 
-        assert_eq!(parsed.supported_signature_algorithms, algorithms);
+        assert_eq!(parsed.supported_signature_algorithms.len(), 1);
+        assert_eq!(
+            parsed.supported_signature_algorithms[0],
+            SignatureAndHashAlgorithm::new(HashAlgorithm::SHA256, SignatureAlgorithm::ECDSA,)
+        );
+    }
+
+    #[test]
+    fn default_does_not_advertise_rsa() {
+        let extension = SignatureAlgorithmsExtension::default();
+
+        assert!(
+            extension
+                .supported_signature_algorithms
+                .iter()
+                .all(|algorithm| algorithm.signature != SignatureAlgorithm::RSA)
+        );
+    }
+
+    #[test]
+    fn capacity_matches_supported() {
+        let extension = SignatureAlgorithmsExtension::default();
+
+        assert_eq!(
+            extension.supported_signature_algorithms.capacity(),
+            SignatureAndHashAlgorithm::supported().len()
+        );
     }
 
     #[test]
