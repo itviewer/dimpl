@@ -3,7 +3,7 @@
 //! dimpl is a DTLS 1.2 and 1.3 implementation aimed at WebRTC. It is a Sans‑IO
 //! state machine you embed into your own UDP/RTC event loop: you feed incoming
 //! datagrams, poll for outgoing records or timers, and wire up certificate
-//! verification and SRTP key export yourself.
+//! verification yourself.
 //!
 //! # Goals
 //! - **DTLS 1.2 and 1.3**: Implements the DTLS handshake and record layer used by WebRTC.
@@ -42,9 +42,8 @@
 //! - **AEAD**: AES‑GCM 128/256, ChaCha20‑Poly1305 (no CBC/EtM modes).
 //! - **Key exchange**: ECDHE (P‑256/P‑384), X25519
 //! - **Signatures**: ECDSA P‑256/SHA‑256, ECDSA P‑384/SHA‑384
-//! - **DTLS‑SRTP**: Exports keying material for `SRTP_AEAD_AES_256_GCM`,
-//!   `SRTP_AEAD_AES_128_GCM`, and `SRTP_AES128_CM_SHA1_80` ([RFC 5764], [RFC 7714]).
-//! - **Extended Master Secret** ([RFC 7627]) is negotiated and enforced (DTLS 1.2).
+//! - **TLS 1.2 master secret**: DTLS 1.2 derives the RFC 5246 master secret
+//!   without requiring Extended Master Secret negotiation.
 //!
 //! ## Certificate model
 //! During the handshake the engine emits
@@ -70,7 +69,6 @@
 //! - `Timeout(Instant)`: schedule a timer and call `handle_timeout` at/after it
 //! - `Connected`: handshake complete
 //! - `PeerCert(&[u8])`: peer leaf certificate (DER) — validate in your app
-//! - `KeyingMaterial(KeyingMaterial, SrtpProfile)`: DTLS‑SRTP export
 //! - `ApplicationData(&[u8])`: plaintext received from peer
 //! - `CloseNotify`: peer sent a `close_notify` alert (graceful shutdown)
 //!
@@ -123,9 +121,6 @@
 //!                 }
 //!                 Output::PeerCert(_der) => {
 //!                     // Inspect peer leaf certificate if desired
-//!                 }
-//!                 Output::KeyingMaterial(_km, _profile) => {
-//!                     // Provide to SRTP stack
 //!                 }
 //!                 Output::ApplicationData(_data) => {
 //!                     // Deliver plaintext to application
@@ -262,8 +257,6 @@ pub use config::{Config, ConfigBuilder, Psk, PskResolver};
 pub mod certificate;
 
 pub mod crypto;
-
-pub use crypto::{KeyingMaterial, SrtpProfile};
 
 mod timer;
 
@@ -920,8 +913,6 @@ pub enum Output<'a> {
     /// Applications must validate this certificate independently (chain,
     /// name/EKU checks, pinning, etc.).
     PeerCert(&'a [u8]),
-    /// Extracted DTLS-SRTP keying material and selected SRTP profile.
-    KeyingMaterial(KeyingMaterial, SrtpProfile),
     /// Received application data plaintext.
     ApplicationData(&'a [u8]),
     /// The peer sent a `close_notify` alert, indicating graceful connection closure.
@@ -936,7 +927,6 @@ impl fmt::Debug for Output<'_> {
             Self::Timeout(v) => write!(f, "Timeout({:?})", v),
             Self::Connected => write!(f, "Connected"),
             Self::PeerCert(v) => write!(f, "PeerCert({})", v.len()),
-            Self::KeyingMaterial(v, p) => write!(f, "KeyingMaterial({}, {:?})", v.len(), p),
             Self::ApplicationData(v) => write!(f, "ApplicationData({})", v.len()),
             Self::CloseNotify => write!(f, "CloseNotify"),
         }

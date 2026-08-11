@@ -27,7 +27,7 @@ use subtle::ConstantTimeEq;
 
 use crate::buffer::Buf;
 use crate::buffer::ToBuf;
-use crate::crypto::{ActiveKeyExchange, SrtpProfile};
+use crate::crypto::ActiveKeyExchange;
 use crate::dtls13::Server;
 use crate::dtls13::engine::Engine;
 use crate::dtls13::message::Asn1Cert;
@@ -57,9 +57,8 @@ use crate::dtls13::message::SignatureScheme;
 use crate::dtls13::message::SupportedGroupsExtension;
 use crate::dtls13::message::SupportedVersionsClientHello;
 use crate::dtls13::message::SupportedVersionsServerHello;
-use crate::dtls13::message::UseSrtpExtension;
 use crate::dtls13::message::parse_cookie_extension;
-use crate::{Error, InternalError, KeyingMaterial, Output};
+use crate::{Error, InternalError, Output};
 
 /// DTLS 1.3 client
 pub struct Client {
@@ -77,9 +76,6 @@ pub struct Client {
 
     /// Storage for extension data
     extension_data: Buf,
-
-    /// The negotiated SRTP profile (if any)
-    negotiated_srtp_profile: Option<SrtpProfile>,
 
     /// Server certificates
     server_certificates: Vec<Buf>,
@@ -131,7 +127,6 @@ pub struct Client {
 pub(crate) enum LocalEvent {
     PeerCert,
     Connected,
-    KeyingMaterial(ArrayVec<u8, 88>, SrtpProfile),
 }
 
 impl Client {
@@ -144,7 +139,6 @@ impl Client {
             random: None,
             session_id: None,
             extension_data: Buf::new(),
-            negotiated_srtp_profile: None,
             server_certificates: Vec::with_capacity(3),
             defragment_buffer: Buf::new(),
             client_auth_requested: false,
@@ -189,7 +183,6 @@ impl Client {
             random: Some(hybrid.random),
             session_id: None,
             extension_data: Buf::new(),
-            negotiated_srtp_profile: None,
             server_certificates: Vec::with_capacity(3),
             defragment_buffer: Buf::new(),
             client_auth_requested: false,
@@ -698,27 +691,10 @@ impl State {
             return Ok(self);
         };
 
-        let Body::EncryptedExtensions(ref ee) = handshake.body else {
+        let Body::EncryptedExtensions(_) = handshake.body else {
             unreachable!()
         };
 
-        // Process extensions
-        for ext in &ee.extensions {
-            if ext.extension_type == ExtensionType::UseSrtp {
-                let ext_data = ext.extension_data(&client.defragment_buffer);
-                let (_, use_srtp) =
-                    UseSrtpExtension::parse(ext_data).map_err(InternalError::from)?;
-                if !use_srtp.profiles.is_empty() {
-                    client.negotiated_srtp_profile = Some(use_srtp.profiles[0].into());
-                    trace!(
-                        "EncryptedExtensions UseSRTP; selected profile: {:?}",
-                        client.negotiated_srtp_profile
-                    );
-                }
-            }
-        }
-
-        client.engine.advance_peer_handshake_seq();
         Ok(Self::AwaitCertificateRequest)
     }
 
@@ -1061,22 +1037,6 @@ impl State {
         // Emit Connected event
         client.local_events.push_back(LocalEvent::Connected);
 
-        // Extract and emit SRTP keying material if negotiated
-        if let Some(profile) = client.negotiated_srtp_profile {
-            if let Ok((keying_material, profile)) =
-                client.engine.extract_srtp_keying_material(profile)
-            {
-                debug!(
-                    "SRTP keying material extracted ({} bytes) for profile: {:?}",
-                    keying_material.len(),
-                    profile
-                );
-                client
-                    .local_events
-                    .push_back(LocalEvent::KeyingMaterial(keying_material, profile));
-            }
-        }
-
         client.engine.release_application_data();
 
         debug!("Handshake complete; ready for application data");
@@ -1261,17 +1221,7 @@ fn handshake_create_client_hello(
         extension_data_range: sa_start..sa_end,
     });
 
-    // 5. use_srtp extension
-    let srtp_start = ext_buf.len();
-    let use_srtp = UseSrtpExtension::default();
-    use_srtp.serialize(&mut ext_buf);
-    let srtp_end = ext_buf.len();
-    extensions.push(Extension {
-        extension_type: ExtensionType::UseSrtp,
-        extension_data_range: srtp_start..srtp_end,
-    });
-
-    // 6. cookie extension (echo from HRR if present)
+    // 5. cookie extension (echo from HRR if present)
     if let Some(cookie_range) = cookie_range {
         let cookie_start = ext_buf.len();
         // Cookie data already includes the u16 length prefix from the HRR
@@ -1570,9 +1520,6 @@ impl LocalEvent {
                 Output::PeerCert(&buf[..l])
             }
             LocalEvent::Connected => Output::Connected,
-            LocalEvent::KeyingMaterial(m, profile) => {
-                Output::KeyingMaterial(KeyingMaterial::new(&m), profile)
-            }
         }
     }
 }

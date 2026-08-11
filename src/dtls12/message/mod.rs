@@ -35,7 +35,6 @@ pub use extension::{Extension, ExtensionType};
 pub use extensions::ec_point_formats::ECPointFormatsExtension;
 pub use extensions::signature_algorithms::SignatureAlgorithmsExtension;
 pub use extensions::supported_groups::SupportedGroupsExtension;
-pub use extensions::use_srtp::{SrtpProfileId, SrtpProfileVec, UseSrtpExtension};
 pub use finished::Finished;
 pub use handshake::{Body, Handshake, Header, MessageType};
 pub use hello_verify::HelloVerifyRequest;

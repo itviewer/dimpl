@@ -2,9 +2,6 @@
 
 use std::ops::Deref;
 
-// Internal module imports
-mod keying;
-
 // Provider traits and implementations
 #[cfg(feature = "aws-lc-rs")]
 pub mod aws_lc_rs;
@@ -19,8 +16,6 @@ mod dtls_aead;
 pub mod prf_hkdf;
 mod provider;
 mod validation;
-
-pub use keying::{KeyingMaterial, SrtpProfile};
 
 // Re-export AEAD types needed for Cipher trait implementations (public API)
 pub use dtls_aead::{Aad, Nonce};
