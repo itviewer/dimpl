@@ -1,5 +1,4 @@
 use super::extension::ExtensionVec;
-use super::extensions::use_srtp::{SrtpProfileId, UseSrtpExtension};
 use super::{CompressionMethod, Dtls12CipherSuite, Extension, ExtensionType};
 use super::{ProtocolVersion, Random, SessionId};
 use crate::buffer::Buf;
@@ -40,9 +39,7 @@ impl ServerHello {
     /// Add extensions to ServerHello using a builder-style API, mirroring ClientHello::with_extensions
     ///
     /// - Uses the provided buffer to stage extension bytes and then stores Range references
-    /// - Includes UseSRTP if a profile is provided
-    /// - Includes Extended Master Secret if the flag is set
-    pub fn with_extensions(mut self, buf: &mut Buf, srtp_profile: Option<SrtpProfileId>) -> Self {
+    pub fn with_extensions(mut self, buf: &mut Buf) -> Self {
         // Clear the buffer and collect extension byte ranges
         buf.clear();
 
@@ -50,20 +47,6 @@ impl ServerHello {
             (ExtensionType, usize, usize),
             { ExtensionType::supported().len() },
         > = ArrayVec::new();
-
-        // UseSRTP (if negotiated)
-        if let Some(pid) = srtp_profile {
-            let start = buf.len();
-            let mut profiles = ArrayVec::new();
-            profiles.push(pid);
-            let ext = UseSrtpExtension::new(profiles, ArrayVec::new());
-            ext.serialize(buf);
-            ranges.push((ExtensionType::UseSrtp, start, buf.len()));
-        }
-
-        // Extended Master Secret (mandatory)
-        let start = buf.len();
-        ranges.push((ExtensionType::ExtendedMasterSecret, start, start));
 
         // Renegotiation Info (RFC 5746) - empty for initial handshake
         let start = buf.len();

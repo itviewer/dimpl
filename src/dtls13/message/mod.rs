@@ -32,7 +32,6 @@ pub use extensions::supported_groups::SupportedGroupsExtension;
 pub use extensions::supported_versions::{
     SupportedVersionsClientHello, SupportedVersionsServerHello,
 };
-pub use extensions::use_srtp::{SrtpProfileId, UseSrtpExtension};
 pub use finished::Finished;
 pub use handshake::{Body, Handshake, Header, KeyUpdateRequest, MessageType};
 pub use id::{Cookie, SessionId};

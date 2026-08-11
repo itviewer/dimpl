@@ -1,5 +1,5 @@
+use super::extensions::SupportedGroupsExtension;
 use super::extensions::{ECPointFormatsExtension, SignatureAlgorithmsExtension};
-use super::extensions::{SupportedGroupsExtension, UseSrtpExtension};
 use super::{CipherSuiteVec, CompressionMethod, CompressionMethodVec, Dtls12CipherSuite};
 use super::{Cookie, Extension, ExtensionType, ProtocolVersion, Random, SessionId};
 use arrayvec::ArrayVec;
@@ -80,12 +80,6 @@ impl ClientHello {
         signature_algorithms.serialize(buf);
         ranges.push((ExtensionType::SignatureAlgorithms, start_pos, buf.len()));
 
-        // Add use_srtp extension for DTLS-SRTP support
-        let use_srtp = UseSrtpExtension::default();
-        let start_pos = buf.len();
-        use_srtp.serialize(buf);
-        ranges.push((ExtensionType::UseSrtp, start_pos, buf.len()));
-
         // // Add session_ticket extension (empty)
         // let start_pos = buf.len();
         // buf.extend_from_slice(&[0x00]); // Empty extension data
@@ -101,13 +95,6 @@ impl ClientHello {
             buf.extend_from_slice(&[0x00]); // Empty extension data
             ranges.push((ExtensionType::EncryptThenMac, start_pos, buf.len()));
         }
-
-        let start_pos = buf.len();
-        ranges.push((
-            ExtensionType::ExtendedMasterSecret,
-            start_pos,
-            start_pos, // No data at all
-        ));
 
         // Now create all extensions using ranges
         for (extension_type, start, end) in ranges {
@@ -258,6 +245,7 @@ impl ClientHello {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Config;
     use crate::buffer::Buf;
 
     const MESSAGE: &[u8] = &[

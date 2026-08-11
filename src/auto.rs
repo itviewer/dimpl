@@ -27,16 +27,13 @@ use crate::dtls13::message::KeyShareEntry;
 use crate::dtls13::message::Random;
 use crate::dtls13::message::SignatureAlgorithmsExtension;
 use crate::dtls13::message::SupportedGroupsExtension;
-use crate::dtls13::message::UseSrtpExtension;
 use crate::types::NamedGroup;
 use crate::{Config, CryptoError, DtlsCertificate, Error, Output, SeededRng, TimeoutError};
 // Extension type constants
 const EXT_SUPPORTED_GROUPS: u16 = 0x000A;
 const EXT_EC_POINT_FORMATS: u16 = 0x000B;
 const EXT_SIGNATURE_ALGORITHMS: u16 = 0x000D;
-const EXT_USE_SRTP: u16 = 0x000E;
 const EXT_PADDING: u16 = 0x0015;
-const EXT_EXTENDED_MASTER_SECRET: u16 = 0x0017;
 const EXT_SUPPORTED_VERSIONS: u16 = 0x002B;
 const EXT_KEY_SHARE: u16 = 0x0033;
 const EXT_RENEGOTIATION_INFO: u16 = 0xFF01;
@@ -166,27 +163,18 @@ impl HybridClientHello {
         sa.serialize(&mut ext_buf);
         ext_entries.push((EXT_SIGNATURE_ALGORITHMS, start, ext_buf.len()));
 
-        // 5. use_srtp
-        let start = ext_buf.len();
-        let use_srtp = UseSrtpExtension::default();
-        use_srtp.serialize(&mut ext_buf);
-        ext_entries.push((EXT_USE_SRTP, start, ext_buf.len()));
-
-        // 6. ec_point_formats (DTLS 1.2 compat: uncompressed only)
+        // 5. ec_point_formats (DTLS 1.2 compat: uncompressed only)
         let start = ext_buf.len();
         ext_buf.push(1); // list length
         ext_buf.push(0); // ECPointFormat::Uncompressed
         ext_entries.push((EXT_EC_POINT_FORMATS, start, ext_buf.len()));
 
-        // 7. extended_master_secret (empty, DTLS 1.2 compat)
-        ext_entries.push((EXT_EXTENDED_MASTER_SECRET, ext_buf.len(), ext_buf.len()));
-
-        // 8. renegotiation_info (empty renegotiated_connection, DTLS 1.2 compat)
+        // 6. renegotiation_info (empty renegotiated_connection, DTLS 1.2 compat)
         let start = ext_buf.len();
         ext_buf.push(0); // renegotiated_connection length = 0
         ext_entries.push((EXT_RENEGOTIATION_INFO, start, ext_buf.len()));
 
-        // 9. padding: fill to MTU
+        // 7. padding: fill to MTU
         let record_header = 13usize;
         let handshake_header = 12usize;
         let body_so_far = ch_body.len()

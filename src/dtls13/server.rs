@@ -3,7 +3,7 @@
 // 1. Client sends ClientHello (plaintext, epoch 0)
 //    - Server validates: legacy_version==DTLS1.2, null compression offered
 //    - Server checks supported_versions for DTLS1.3
-//    - Server selects cipher suite, key exchange group, SRTP profile
+//    - Server selects cipher suite and key exchange group
 //    - If no cookie: send HelloRetryRequest with HMAC-based cookie
 //    - If cookie present: validate HMAC, proceed
 //    - If no matching key_share but supported_groups match: HRR for key exchange
@@ -19,7 +19,7 @@
 // 8. Client sends Certificate (if requested, encrypted, epoch 2)
 // 9. Client sends CertificateVerify (if cert present, encrypted, epoch 2)
 // 10. Client sends Finished (encrypted, epoch 2)
-//     - Server verifies, emits Connected, extracts SRTP keying material
+//     - Server verifies and emits Connected
 // 11. Application data flows on epoch 3
 //
 // This implementation is a Sans-IO DTLS 1.3 server.
@@ -33,7 +33,7 @@ use subtle::ConstantTimeEq;
 
 use crate::buffer::Buf;
 use crate::buffer::ToBuf;
-use crate::crypto::{ActiveKeyExchange, SrtpProfile};
+use crate::crypto::ActiveKeyExchange;
 use crate::dtls13::Client;
 use crate::dtls13::client::LocalEvent;
 use crate::dtls13::client::handshake_create_certificate;
@@ -64,7 +64,6 @@ use crate::dtls13::message::SignatureScheme;
 use crate::dtls13::message::SupportedGroupsExtension;
 use crate::dtls13::message::SupportedVersionsClientHello;
 use crate::dtls13::message::SupportedVersionsServerHello;
-use crate::dtls13::message::UseSrtpExtension;
 use crate::dtls13::message::parse_cookie_extension;
 use crate::{Config, DtlsCertificate, Error, InternalError, Output};
 
@@ -92,9 +91,6 @@ pub struct Server {
 
     /// Storage for extension data.
     extension_data: Buf,
-
-    /// The negotiated SRTP profile (if any).
-    negotiated_srtp_profile: Option<SrtpProfile>,
 
     /// Client certificates.
     client_certificates: Vec<Buf>,
@@ -192,7 +188,6 @@ impl Server {
             random: None,
             client_session_id: None,
             extension_data: Buf::new(),
-            negotiated_srtp_profile: None,
             client_certificates: Vec::with_capacity(3),
             defragment_buffer: Buf::new(),
             last_now: now,
@@ -459,8 +454,6 @@ impl State {
             ArrayVec<(NamedGroup, std::ops::Range<usize>), { NamedGroup::supported().len() }>,
         > = None;
         let mut client_supported_groups: Option<ArrayVec<NamedGroup, 4>> = None;
-        let mut client_srtp_profiles: Option<ArrayVec<crate::dtls13::message::SrtpProfileId, 3>> =
-            None;
         let mut client_cookie_data: Option<ArrayVec<u8, 32>> = None;
 
         for ext in &client_hello.extensions {
@@ -500,12 +493,6 @@ impl State {
                     let ext_data = ext.extension_data(&server.defragment_buffer);
                     // Parse but we don't currently filter by signature algorithms
                     let _ = SignatureAlgorithmsExtension::parse(ext_data);
-                }
-                ExtensionType::UseSrtp => {
-                    let ext_data = ext.extension_data(&server.defragment_buffer);
-                    let (_, use_srtp) =
-                        UseSrtpExtension::parse(ext_data).map_err(InternalError::from)?;
-                    client_srtp_profiles = Some(use_srtp.profiles);
                 }
                 ExtensionType::Cookie => {
                     let ext_data = ext.extension_data(&server.defragment_buffer);
@@ -732,19 +719,6 @@ impl State {
 
         server.shared_secret = Some(shared_secret);
 
-        // Select SRTP profile: first from client list that the server supports.
-        // Per RFC 5764 Section 4.1.1, the server MUST select a profile that
-        // both sides support.
-        if let Some(ref profiles) = client_srtp_profiles {
-            for profile_id in profiles {
-                let profile: SrtpProfile = (*profile_id).into();
-                if SrtpProfile::ALL.contains(&profile) {
-                    server.negotiated_srtp_profile = Some(profile);
-                    break;
-                }
-            }
-        }
-
         // Store selected group and public key range for ServerHello
         // already completed
         server.active_key_exchange = None;
@@ -858,12 +832,10 @@ impl State {
     fn send_encrypted_extensions(self, server: &mut Server) -> Result<Self, InternalError> {
         debug!("Sending EncryptedExtensions");
 
-        let negotiated_srtp = server.negotiated_srtp_profile;
-
         server
             .engine
             .create_handshake(MessageType::EncryptedExtensions, |body, _engine| {
-                handshake_create_encrypted_extensions(body, negotiated_srtp)
+                handshake_create_encrypted_extensions(body)
             })?;
 
         if server.engine.config().require_client_certificate() {
@@ -1151,22 +1123,6 @@ impl State {
         // Emit Connected event
         server.local_events.push_back(LocalEvent::Connected);
 
-        // Extract and emit SRTP keying material if negotiated
-        if let Some(profile) = server.negotiated_srtp_profile {
-            if let Ok((keying_material, profile)) =
-                server.engine.extract_srtp_keying_material(profile)
-            {
-                debug!(
-                    "SRTP keying material extracted ({} bytes) for profile: {:?}",
-                    keying_material.len(),
-                    profile
-                );
-                server
-                    .local_events
-                    .push_back(LocalEvent::KeyingMaterial(keying_material, profile));
-            }
-        }
-
         server
             .engine
             .release_application_data_retaining_handshake_keys();
@@ -1413,41 +1369,8 @@ fn handshake_create_server_hello(
     Ok(())
 }
 
-fn handshake_create_encrypted_extensions(
-    body: &mut Buf,
-    negotiated_srtp: Option<SrtpProfile>,
-) -> Result<(), Error> {
-    let mut ext_buf = Buf::new();
-    let mut extensions: ArrayVec<Extension, 5> = ArrayVec::new();
-
-    // use_srtp extension if negotiated
-    if let Some(profile) = negotiated_srtp {
-        let srtp_start = ext_buf.len();
-        let profile_id: crate::dtls13::message::SrtpProfileId = profile.into();
-        let mut profiles = ArrayVec::new();
-        profiles.push(profile_id);
-        let use_srtp = UseSrtpExtension::new(profiles, ArrayVec::new());
-        use_srtp.serialize(&mut ext_buf);
-        let srtp_end = ext_buf.len();
-        extensions.push(Extension {
-            extension_type: ExtensionType::UseSrtp,
-            extension_data_range: srtp_start..srtp_end,
-        });
-    }
-
-    // Serialize EncryptedExtensions: extensions_len(2) + extensions
-    let mut extensions_len = 0usize;
-    for ext in &extensions {
-        let ext_data = ext.extension_data(&ext_buf);
-        extensions_len += 4 + ext_data.len();
-    }
-
-    body.extend_from_slice(&(extensions_len as u16).to_be_bytes());
-
-    for ext in &extensions {
-        ext.serialize(&ext_buf, body);
-    }
-
+fn handshake_create_encrypted_extensions(body: &mut Buf) -> Result<(), Error> {
+    body.extend_from_slice(&0u16.to_be_bytes());
     Ok(())
 }
 

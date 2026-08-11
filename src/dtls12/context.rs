@@ -7,7 +7,6 @@ use arrayvec::ArrayVec;
 use crate::CryptoError;
 use crate::buffer::{Buf, TmpBuf, ToBuf};
 use crate::crypto;
-use crate::crypto::SrtpProfile;
 use crate::crypto::{Aad, Iv, Nonce};
 use crate::dtls12::message::DigitallySigned;
 use crate::dtls12::message::{Asn1Cert, Certificate};
@@ -64,10 +63,10 @@ pub struct CryptoContext {
     /// Resolved PSK value (set during handshake after identity exchange)
     psk: Option<Vec<u8>>,
 
-    /// Client random (needed for SRTP key export per RFC 5705)
+    /// Client random (stored for key derivation context)
     client_random: Option<ArrayVec<u8, 32>>,
 
-    /// Server random (needed for SRTP key export per RFC 5705)
+    /// Server random (stored for key derivation context)
     server_random: Option<ArrayVec<u8, 32>>,
 }
 
@@ -217,23 +216,31 @@ impl CryptoContext {
         Ok(())
     }
 
-    /// Derive master secret using Extended Master Secret (RFC 7627)
-    pub fn derive_extended_master_secret(
+    /// Derive the TLS 1.2 master secret (RFC 5246).
+    pub fn derive_master_secret(
         &mut self,
-        session_hash: &[u8],
+        client_random: &[u8],
+        server_random: &[u8],
         hash: HashAlgorithm,
         out: &mut Buf,
         scratch: &mut Buf,
     ) -> Result<(), CryptoError> {
-        trace!("Deriving extended master secret");
+        trace!("Deriving master secret");
         let Some(pms) = &self.pre_master_secret else {
             return Err(CryptoError::PreMasterSecretNotAvailable);
         };
+
+        let mut seed = ArrayVec::<u8, 64>::new();
+        seed.try_extend_from_slice(client_random)
+            .map_err(|_| CryptoError::MasterSecretTooLong)?;
+        seed.try_extend_from_slice(server_random)
+            .map_err(|_| CryptoError::MasterSecretTooLong)?;
+
         crypto::prf_hkdf::prf_tls12(
             self.provider().hmac_provider,
             pms,
-            "extended master secret",
-            session_hash,
+            "master secret",
+            &seed,
             out,
             48,
             scratch,
@@ -262,7 +269,7 @@ impl CryptoContext {
             return Err(CryptoError::MasterSecretNotAvailable);
         };
 
-        // Store the randoms for later SRTP key export (RFC 5705)
+        // Store the randoms for the active session
         let mut client_random_arr = ArrayVec::new();
         client_random_arr
             .try_extend_from_slice(client_random)
@@ -468,58 +475,6 @@ impl CryptoContext {
             .try_extend_from_slice(out)
             .map_err(|_| CryptoError::VerifyDataTooLong)?;
         Ok(verify_data)
-    }
-
-    /// Extract SRTP keying material from the master secret
-    /// This is per RFC 5764 (DTLS-SRTP) section 4.2 and RFC 5705 (TLS Exporter)
-    pub fn extract_srtp_keying_material(
-        &self,
-        profile: SrtpProfile,
-        hash: HashAlgorithm,
-        out: &mut Buf,
-        scratch: &mut Buf,
-    ) -> Result<ArrayVec<u8, 88>, CryptoError> {
-        const DTLS_SRTP_KEY_LABEL: &str = "EXTRACTOR-dtls_srtp";
-
-        let master_secret = match &self.master_secret {
-            Some(ms) => ms,
-            None => return Err(CryptoError::MasterSecretNotAvailable),
-        };
-
-        let client_random = match &self.client_random {
-            Some(cr) => cr,
-            None => return Err(CryptoError::ClientRandomNotAvailable),
-        };
-
-        let server_random = match &self.server_random {
-            Some(sr) => sr,
-            None => return Err(CryptoError::ServerRandomNotAvailable),
-        };
-
-        // Per RFC 5705, the exporter uses: PRF(master_secret, label, client_random + server_random)
-        // The seed for DTLS-SRTP exporter is client_random + server_random (no additional context)
-        let mut seed = ArrayVec::<u8, 64>::new();
-        seed.try_extend_from_slice(client_random)
-            .expect("client_random too long");
-        seed.try_extend_from_slice(server_random)
-            .expect("server_random too long");
-
-        crypto::prf_hkdf::prf_tls12(
-            self.provider().hmac_provider,
-            master_secret,
-            DTLS_SRTP_KEY_LABEL,
-            &seed,
-            out,
-            profile.keying_material_len(),
-            scratch,
-            hash,
-        )?;
-        let mut keying_material = ArrayVec::new();
-        keying_material
-            .try_extend_from_slice(out)
-            .map_err(|_| CryptoError::KeyingMaterialTooLong)?;
-
-        Ok(keying_material)
     }
 
     /// Signature algorithm for the configured private key.

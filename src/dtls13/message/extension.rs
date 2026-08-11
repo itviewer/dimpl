@@ -119,13 +119,12 @@ impl ExtensionType {
     }
 
     /// Supported extension types that this DTLS 1.3 implementation handles.
-    pub const fn supported() -> &'static [ExtensionType; 6] {
+    pub const fn supported() -> &'static [ExtensionType; 5] {
         &[
             ExtensionType::SupportedVersions,
             ExtensionType::SupportedGroups,
             ExtensionType::SignatureAlgorithms,
             ExtensionType::KeyShare,
-            ExtensionType::UseSrtp,
             ExtensionType::Cookie,
         ]
     }

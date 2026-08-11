@@ -19,7 +19,6 @@ use arrayvec::ArrayVec;
 use subtle::ConstantTimeEq;
 
 use crate::buffer::{Buf, ToBuf};
-use crate::crypto::SrtpProfile;
 use crate::dtls12::Server;
 use crate::dtls12::context::AuthMode;
 use crate::dtls12::engine::Engine;
@@ -27,9 +26,9 @@ use crate::dtls12::message::{Body, CipherSuiteVec, ClientHello, ClientKeyExchang
 use crate::dtls12::message::{ClientPskKeys, ServerKeyExchangeParams};
 use crate::dtls12::message::{CompressionMethod, ContentType, Cookie};
 use crate::dtls12::message::{DigitallySigned, Dtls12CipherSuite};
-use crate::dtls12::message::{ExtensionType, KeyExchangeAlgorithm, MessageType, ProtocolVersion};
-use crate::dtls12::message::{Random, SessionId, SignatureAndHashAlgorithm, UseSrtpExtension};
-use crate::{Config, DtlsCertificate, Error, InternalError, KeyingMaterial, Output};
+use crate::dtls12::message::{KeyExchangeAlgorithm, MessageType, ProtocolVersion};
+use crate::dtls12::message::{Random, SessionId, SignatureAndHashAlgorithm};
+use crate::{Config, DtlsCertificate, Error, InternalError, Output};
 
 /// DTLS client
 pub struct Client {
@@ -52,9 +51,6 @@ pub struct Client {
 
     /// Storage for extension data
     extension_data: Buf,
-
-    /// The negotiated SRTP profile (if any)
-    negotiated_srtp_profile: Option<SrtpProfile>,
 
     /// Server random. Set by ServerHello.
     server_random: Option<Random>,
@@ -86,7 +82,6 @@ pub struct Client {
 pub(crate) enum LocalEvent {
     PeerCert,
     Connected,
-    KeyingMaterial(ArrayVec<u8, 88>, SrtpProfile),
 }
 
 impl Client {
@@ -100,7 +95,6 @@ impl Client {
             session_id: None,
             cookie: None,
             extension_data: Buf::new(),
-            negotiated_srtp_profile: None,
             server_random: None,
             server_certificates: Vec::with_capacity(3),
             defragment_buffer: Buf::new(),
@@ -164,7 +158,6 @@ impl Client {
             session_id: None,
             cookie: None,
             extension_data: Buf::new(),
-            negotiated_srtp_profile: None,
             server_random: None,
             server_certificates: Vec::with_capacity(3),
             defragment_buffer: Buf::new(),
@@ -508,50 +501,6 @@ impl State {
         client.engine.set_cipher_suite(cs);
         client.session_id = Some(server_hello.session_id);
         client.server_random = Some(server_hello.random);
-
-        let mut extended_master_secret = false;
-
-        // Check for use_srtp and extended_master_secret extensions
-        let Some(extensions) = &server_hello.extensions else {
-            return Err((Error::IncompleteServerHello).into());
-        };
-
-        for extension in extensions {
-            if extension.extension_type == ExtensionType::UseSrtp {
-                // Parse the use_srtp extension to get the selected profile
-                let extension_data = extension.extension_data(&client.defragment_buffer);
-                let (_, use_srtp) =
-                    UseSrtpExtension::parse(extension_data).map_err(InternalError::from)?;
-                // Store the first profile as our negotiated profile
-                if !use_srtp.profiles.is_empty() {
-                    client.negotiated_srtp_profile = Some(use_srtp.profiles[0].into());
-                    trace!(
-                        "ServerHello UseSRTP extension processed; selected profile: {:?}",
-                        client.negotiated_srtp_profile
-                    );
-                }
-            }
-
-            // We are to use extended master secret
-            if extension.extension_type == ExtensionType::ExtendedMasterSecret {
-                extended_master_secret = true;
-                trace!("Server negotiated Extended Master Secret");
-            }
-        }
-
-        // Without extended master secret, in DTLS1.2 a security attack
-        // reusing the same master secret is possible.
-        if !extended_master_secret {
-            return Err(Error::SecurityError(
-                crate::SecurityError::ExtendedMasterSecretNotNegotiated,
-            )
-            .into());
-        }
-
-        if let Some(profile) = client.negotiated_srtp_profile {
-            debug!("Negotiated SRTP profile: {:?}", profile);
-        }
-        trace!("Extended Master Secret enabled");
 
         // PSK suites skip Certificate; go directly to ServerKeyExchange
         if cs.is_psk() {
@@ -995,26 +944,21 @@ impl State {
         let client_random_buf = client_random_buf_b;
         let server_random_buf = server_random_buf_b;
 
-        // Derive master secret (use EMS if negotiated)
+        // Derive the TLS 1.2 master secret.
         let suite_hash = cipher_suite.hash_algorithm();
 
-        // Use the captured session hash from when ServerHelloDone was received
-        let session_hash = client
-            .captured_session_hash
-            .as_ref()
-            .ok_or(Error::InvalidState(
-                crate::InvalidStateError::ExtendedMasterSecretSessionHashMissing,
-            ))?;
-        trace!(
-            "Using captured session hash for Extended Master Secret (length: {})",
-            session_hash.len()
-        );
         let mut out = client.engine.pop_buffer();
         let mut scratch = client.engine.pop_buffer();
         client
             .engine
             .crypto_context_mut()
-            .derive_extended_master_secret(session_hash, suite_hash, &mut out, &mut scratch)
+            .derive_master_secret(
+                &client_random_buf,
+                &server_random_buf,
+                suite_hash,
+                &mut out,
+                &mut scratch,
+            )
             .map_err(Error::CryptoError)?;
 
         // Derive the encryption/decryption keys
@@ -1153,38 +1097,6 @@ impl State {
 
         // Emit Connected event
         client.local_events.push_back(LocalEvent::Connected);
-
-        // Extract and emit SRTP keying material if we have a negotiated profile
-        if let Some(profile) = client.negotiated_srtp_profile {
-            let suite_hash = client.engine.cipher_suite().unwrap().hash_algorithm();
-
-            let mut out = client.engine.pop_buffer();
-            let mut scratch = client.engine.pop_buffer();
-            if let Ok(keying_material) = client
-                .engine
-                .crypto_context()
-                .extract_srtp_keying_material(profile, suite_hash, &mut out, &mut scratch)
-            {
-                client.engine.push_buffer(out);
-                client.engine.push_buffer(scratch);
-                // Emit the keying material event with the negotiated profile
-                debug!(
-                    "SRTP keying material extracted ({} bytes) for profile: {:?}",
-                    keying_material.len(),
-                    profile
-                );
-                // expect should be correct here since we negotiated the profile
-                let profile = client
-                    .negotiated_srtp_profile
-                    .expect("SRTP profile should be negotiated");
-                client
-                    .local_events
-                    .push_back(LocalEvent::KeyingMaterial(keying_material, profile));
-            } else {
-                client.engine.push_buffer(out);
-                client.engine.push_buffer(scratch);
-            }
-        }
 
         client.engine.release_application_data();
 
@@ -1398,9 +1310,6 @@ impl LocalEvent {
                 Output::PeerCert(&buf[..l])
             }
             LocalEvent::Connected => Output::Connected,
-            LocalEvent::KeyingMaterial(m, profile) => {
-                Output::KeyingMaterial(KeyingMaterial::new(&m), profile)
-            }
         }
     }
 }
