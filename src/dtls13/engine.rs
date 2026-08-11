@@ -2196,64 +2196,6 @@ impl Engine {
             .map_err(Error::CryptoError)
     }
 
-    // =========================================================================
-    // Extract SRTP Keying Material
-    // =========================================================================
-
-    pub fn extract_srtp_keying_material(
-        &self,
-        profile: crate::crypto::SrtpProfile,
-    ) -> Result<(ArrayVec<u8, 88>, crate::crypto::SrtpProfile), Error> {
-        let hash = self.hash_algorithm();
-        let hash_len = hash.output_len();
-        let hmac = self.hmac();
-
-        let exp_master = self
-            .exporter_master_secret
-            .as_ref()
-            .ok_or(Error::CryptoError(
-                crate::CryptoError::ExporterMasterSecretNotDerived,
-            ))?;
-
-        let total_len = profile.keying_material_len();
-
-        // RFC 8446 Section 7.5:
-        // 1. derived_secret = Derive-Secret(exporter_master_secret, label, "")
-        let empty_hash = self.transcript_hash_of(b"");
-        let mut derived = Buf::new();
-        prf_hkdf::hkdf_expand_label_dtls13(
-            hmac,
-            hash,
-            exp_master,
-            b"EXTRACTOR-dtls_srtp",
-            &empty_hash,
-            &mut derived,
-            hash_len,
-        )
-        .map_err(Error::CryptoError)?;
-
-        // 2. result = HKDF-Expand-Label(derived_secret, "exporter", Hash(context), length)
-        let context_hash = self.transcript_hash_of(b"");
-        let mut keying_material_buf = Buf::new();
-        prf_hkdf::hkdf_expand_label_dtls13(
-            hmac,
-            hash,
-            &derived,
-            b"exporter",
-            &context_hash,
-            &mut keying_material_buf,
-            total_len,
-        )
-        .map_err(Error::CryptoError)?;
-
-        let mut keying_material = ArrayVec::new();
-        for &b in keying_material_buf.iter().take(total_len) {
-            keying_material.push(b);
-        }
-
-        Ok((keying_material, profile))
-    }
-
     pub fn random(&mut self) -> Random {
         Random::new(&mut self.rng)
     }
