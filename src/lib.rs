@@ -233,6 +233,8 @@ mod dtls13;
 use dtls12::{Client as Client12, Server as Server12};
 use dtls13::{Client as Client13, Server as Server13};
 
+pub use dtls12::SessionStore;
+
 use auto::ClientPending;
 
 mod auto;
@@ -951,6 +953,35 @@ mod test {
         }
     }
 
+    struct FixedSessionStore;
+
+    impl SessionStore for FixedSessionStore {
+        fn session_id(&self) -> [u8; 32] {
+            [0xA5; 32]
+        }
+
+        fn master_secret(&self, key: &[u8]) -> Result<[u8; 48], Box<dyn std::error::Error>> {
+            if key == [0xA5; 32] {
+                Ok([0x5A; 48])
+            } else {
+                Err("unknown session".into())
+            }
+        }
+    }
+
+    fn forward(from: &mut Dtls, to: &mut Dtls, buf: &mut [u8]) -> Result<bool, Error> {
+        let mut connected = false;
+        loop {
+            match from.poll_output(buf) {
+                Output::Packet(packet) => to.handle_packet(packet)?,
+                Output::Connected => connected = true,
+                Output::PeerCert(_) => {}
+                Output::Timeout(_) => return Ok(connected),
+                output => panic!("unexpected output during handshake: {output:?}"),
+            }
+        }
+    }
+
     fn new_instance() -> Dtls {
         let client_cert =
             generate_self_signed_certificate().expect("Failed to generate client cert");
@@ -988,6 +1019,37 @@ mod test {
         dtls.set_active(true);
         assert!(dtls.is_active());
         dtls.set_active(false);
+    }
+
+    #[test]
+    fn test_dtls12_session_resumption() {
+        let config = Arc::new(
+            Config::builder()
+                .use_server_cookie(false)
+                .with_session_store(Arc::new(FixedSessionStore))
+                .build()
+                .expect("config"),
+        );
+        let server_certificate = generate_self_signed_certificate().expect("server certificate");
+        let client_certificate = generate_self_signed_certificate().expect("client certificate");
+        let now = Instant::now();
+        let mut server = Dtls::new_12(config.clone(), server_certificate, now);
+        let mut client = Dtls::new_12(config, client_certificate, now);
+        client.set_active(true);
+        server.handle_timeout(now).expect("start server");
+        client.handle_timeout(now).expect("start client");
+
+        let mut buf = [0; 2048];
+        let mut server_connected = false;
+        let mut client_connected = false;
+        for _ in 0..10 {
+            client_connected |= forward(&mut client, &mut server, &mut buf).expect("client output");
+            server_connected |= forward(&mut server, &mut client, &mut buf).expect("server output");
+            if client_connected && server_connected {
+                return;
+            }
+        }
+        panic!("resumed DTLS 1.2 handshake did not complete");
     }
 
     #[test]

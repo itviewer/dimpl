@@ -33,6 +33,8 @@ pub mod incoming;
 pub mod message;
 mod queue;
 mod server;
+mod session;
 
 pub use client::Client;
 pub use server::Server;
+pub use session::SessionStore;

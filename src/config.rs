@@ -3,6 +3,7 @@ use std::panic::{RefUnwindSafe, UnwindSafe};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::SessionStore;
 use crate::crypto::{CryptoProvider, SupportedDtls12CipherSuite};
 use crate::crypto::{SupportedDtls13CipherSuite, SupportedKxGroup};
 use crate::dtls12::message::Dtls12CipherSuite;
@@ -76,6 +77,7 @@ pub struct Config {
     dtls13_cipher_suites: Option<Vec<Dtls13CipherSuite>>,
     kx_groups: Option<Vec<NamedGroup>>,
     psk: Option<Psk>,
+    session_store: Option<Arc<dyn SessionStore>>,
 }
 
 impl Config {
@@ -97,6 +99,7 @@ impl Config {
             dtls13_cipher_suites: None,
             kx_groups: None,
             psk: None,
+            session_store: None,
         }
     }
 
@@ -203,6 +206,11 @@ impl Config {
         self.psk.as_ref()
     }
 
+    /// DTLS 1.2 session store used for session resumption, if configured.
+    pub fn session_store(&self) -> Option<&dyn SessionStore> {
+        self.session_store.as_deref()
+    }
+
     /// PSK identity for the client to send during handshake.
     pub fn psk_identity(&self) -> Option<&[u8]> {
         match &self.psk {
@@ -304,6 +312,7 @@ pub struct ConfigBuilder {
     dtls13_cipher_suites: Option<Vec<Dtls13CipherSuite>>,
     kx_groups: Option<Vec<NamedGroup>>,
     psk: Option<Psk>,
+    session_store: Option<Arc<dyn SessionStore>>,
 }
 
 impl ConfigBuilder {
@@ -474,6 +483,16 @@ impl ConfigBuilder {
         self
     }
 
+    /// Configure DTLS 1.2 session resumption.
+    ///
+    /// The store supplies the session ID sent by clients and resolves the
+    /// corresponding TLS 1.2 master secret on both endpoints. A server falls
+    /// back to a full handshake when the offered session ID is not found.
+    pub fn with_session_store(mut self, store: Arc<dyn SessionStore>) -> Self {
+        self.session_store = Some(store);
+        self
+    }
+
     /// Build the configuration.
     ///
     /// This validates the crypto provider before returning the configuration.
@@ -610,6 +629,7 @@ impl ConfigBuilder {
             dtls13_cipher_suites: self.dtls13_cipher_suites,
             kx_groups: self.kx_groups,
             psk: self.psk,
+            session_store: self.session_store,
         })
     }
 }
@@ -660,6 +680,7 @@ impl fmt::Debug for Config {
             .field("dtls13_cipher_suites", &self.dtls13_cipher_suites)
             .field("kx_groups", &self.kx_groups)
             .field("psk", &self.psk)
+            .field("session_store", &self.session_store.as_ref().map(|_| "..."))
             .finish()
     }
 }
@@ -685,6 +706,7 @@ impl fmt::Debug for ConfigBuilder {
             .field("dtls13_cipher_suites", &self.dtls13_cipher_suites)
             .field("kx_groups", &self.kx_groups)
             .field("psk", &self.psk)
+            .field("session_store", &self.session_store.as_ref().map(|_| "..."))
             .finish()
     }
 }
@@ -692,6 +714,30 @@ impl fmt::Debug for ConfigBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct TestSessionStore;
+
+    impl SessionStore for TestSessionStore {
+        fn session_id(&self) -> [u8; 32] {
+            [0xA5; 32]
+        }
+
+        fn master_secret(&self, _key: &[u8]) -> Result<[u8; 48], Box<dyn std::error::Error>> {
+            Ok([0x5A; 48])
+        }
+    }
+
+    #[test]
+    fn session_store_is_available_from_config() {
+        let config = Config::builder()
+            .with_session_store(Arc::new(TestSessionStore))
+            .build()
+            .expect("session store config should build");
+
+        let store = config.session_store().expect("session store");
+        assert_eq!(store.session_id(), [0xA5; 32]);
+        assert_eq!(store.master_secret(&[0xA5; 32]).unwrap(), [0x5A; 48]);
+    }
 
     #[test]
     fn rejects_zero_mtu() {
