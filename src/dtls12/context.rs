@@ -256,6 +256,15 @@ impl CryptoContext {
         Ok(())
     }
 
+    /// Install a cached TLS 1.2 master secret for an abbreviated handshake.
+    pub fn set_master_secret(&mut self, master_secret: [u8; 48]) {
+        let mut secret = ArrayVec::new();
+        // unwrap: the fixed-size TLS 1.2 master secret always fits in 128 bytes.
+        secret.try_extend_from_slice(&master_secret).unwrap();
+        self.master_secret = Some(secret);
+        self.pre_master_secret = None;
+    }
+
     /// Derive keys for encryption/decryption
     pub fn derive_keys(
         &mut self,

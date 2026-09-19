@@ -54,8 +54,11 @@ pub struct Server {
     /// Random unique data (with gmt timestamp). Used for signature checks.
     random: Option<Random>,
 
-    /// SessionId we provide to the client (unused/resumption not implemented).
+    /// Session ID echoed to a client when resuming a cached session.
     session_id: Option<SessionId>,
+
+    /// Whether this handshake reuses a cached TLS 1.2 master secret.
+    resumed: bool,
 
     /// Cookie secret for HMAC, generated per-server instance
     cookie_secret: [u8; 32],
@@ -105,6 +108,10 @@ pub struct Server {
 enum State {
     AwaitClientHello,
     SendServerHello,
+    SendResumedChangeCipherSpec,
+    SendResumedFinished,
+    AwaitResumedChangeCipherSpec,
+    AwaitResumedFinished,
     SendCertificate,
     SendServerKeyExchange,
     SendCertificateRequest,
@@ -160,6 +167,7 @@ impl Server {
             engine,
             random: None,
             session_id: None,
+            resumed: false,
             cookie_secret,
             extension_data: Buf::new(),
             client_supported_groups: None,
@@ -284,6 +292,10 @@ impl State {
         match self {
             State::AwaitClientHello => "AwaitClientHello",
             State::SendServerHello => "SendServerHello",
+            State::SendResumedChangeCipherSpec => "SendResumedChangeCipherSpec",
+            State::SendResumedFinished => "SendResumedFinished",
+            State::AwaitResumedChangeCipherSpec => "AwaitResumedChangeCipherSpec",
+            State::AwaitResumedFinished => "AwaitResumedFinished",
             State::SendCertificate => "SendCertificate",
             State::SendServerKeyExchange => "SendServerKeyExchange",
             State::SendCertificateRequest => "SendCertificateRequest",
@@ -304,6 +316,10 @@ impl State {
         match self {
             State::AwaitClientHello => self.await_client_hello(server),
             State::SendServerHello => self.send_server_hello(server),
+            State::SendResumedChangeCipherSpec => self.send_resumed_change_cipher_spec(server),
+            State::SendResumedFinished => self.send_resumed_finished(server),
+            State::AwaitResumedChangeCipherSpec => self.await_resumed_change_cipher_spec(server),
+            State::AwaitResumedFinished => self.await_resumed_finished(server),
             State::SendCertificate => self.send_certificate(server),
             State::SendServerKeyExchange => self.send_server_key_exchange(server),
             State::SendCertificateRequest => self.send_certificate_request(server),
@@ -393,6 +409,25 @@ impl State {
 
         trace!("Accepted ClientHello cookie; proceeding with handshake");
 
+        // A cache miss deliberately falls through to a complete handshake.
+        // This prevents a stale or unknown client session ID from becoming a
+        // fatal protocol error.
+        if !ch.session_id.is_empty() {
+            if let Some(master_secret) = server
+                .engine
+                .config()
+                .session_store()
+                .and_then(|store| store.master_secret(&ch.session_id).ok())
+            {
+                server
+                    .engine
+                    .crypto_context_mut()
+                    .set_master_secret(master_secret);
+                server.session_id = Some(ch.session_id);
+                server.resumed = true;
+            }
+        }
+
         // Client offered suites; we pick per client order intersecting allowed and server key compatibility
         let mut selected: Option<Dtls12CipherSuite> = None;
         for s in ch.cipher_suites.iter() {
@@ -477,12 +512,98 @@ impl State {
             crate::InvalidStateError::NoCipherSuiteSelected,
         ))?;
 
+        if server.resumed {
+            let client_random = server.client_random.ok_or(Error::InvalidState(
+                crate::InvalidStateError::NoClientRandom,
+            ))?;
+            // unwrap: is ok because we set the random in handle_timeout.
+            let server_random = server.random.unwrap();
+            let mut client_random_buf = Buf::new();
+            let mut server_random_buf = Buf::new();
+            client_random.serialize(&mut client_random_buf);
+            server_random.serialize(&mut server_random_buf);
+            let mut out = server.engine.pop_buffer();
+            let mut scratch = server.engine.pop_buffer();
+            server
+                .engine
+                .crypto_context_mut()
+                .derive_keys(
+                    cs,
+                    &client_random_buf,
+                    &server_random_buf,
+                    &mut out,
+                    &mut scratch,
+                )
+                .map_err(Error::CryptoError)?;
+            server.engine.push_buffer(out);
+            server.engine.push_buffer(scratch);
+            trace!("Resuming DTLS 1.2 session");
+            return Ok(Self::SendResumedChangeCipherSpec);
+        }
+
         // PSK suites skip Certificate
         if cs.is_psk() {
             Ok(Self::SendServerKeyExchange)
         } else {
             Ok(Self::SendCertificate)
         }
+    }
+
+    fn send_resumed_change_cipher_spec(self, server: &mut Server) -> Result<Self, InternalError> {
+        trace!("Sending resumed ChangeCipherSpec");
+        server
+            .engine
+            .create_record(ContentType::ChangeCipherSpec, 0, true, |body| body.push(1))?;
+        Ok(Self::SendResumedFinished)
+    }
+
+    fn send_resumed_finished(self, server: &mut Server) -> Result<Self, InternalError> {
+        trace!("Sending resumed Finished message");
+        server
+            .engine
+            .create_handshake(MessageType::Finished, |body, engine| {
+                let verify_data = engine.generate_verify_data(false)?;
+                body.extend_from_slice(&verify_data);
+                Ok(())
+            })?;
+        Ok(Self::AwaitResumedChangeCipherSpec)
+    }
+
+    fn await_resumed_change_cipher_spec(self, server: &mut Server) -> Result<Self, InternalError> {
+        let Some(_) = server.engine.next_record(ContentType::ChangeCipherSpec) else {
+            return Ok(self);
+        };
+        trace!("Received resumed ChangeCipherSpec; enabling peer encryption");
+        server.engine.drop_pending_ccs();
+        server.engine.enable_peer_encryption()?;
+        Ok(Self::AwaitResumedFinished)
+    }
+
+    fn await_resumed_finished(self, server: &mut Server) -> Result<Self, InternalError> {
+        // The client's Finished is computed after the server's Finished, so it
+        // covers ClientHello, ServerHello, and the server Finished.
+        let expected = server.engine.generate_verify_data(true)?;
+        let maybe = server
+            .engine
+            .next_handshake(MessageType::Finished, &mut server.defragment_buffer)?;
+        let Some(handshake) = maybe else {
+            return Ok(self);
+        };
+        let Body::Finished(finished) = handshake.body else {
+            unreachable!()
+        };
+        let verify_data = &server.defragment_buffer[finished.verify_data_range];
+        if !bool::from(verify_data.ct_eq(expected.as_slice())) {
+            return Err(Error::SecurityError(
+                crate::SecurityError::ClientFinishedVerificationFailed,
+            )
+            .into());
+        }
+
+        server.engine.flight_stop_resend_timers();
+        server.local_events.push_back(LocalEvent::Connected);
+        server.engine.release_application_data();
+        Ok(Self::AwaitApplicationData)
     }
 
     fn send_certificate(self, server: &mut Server) -> Result<Self, InternalError> {
